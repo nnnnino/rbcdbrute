@@ -1,1 +1,8 @@
 venv
+.venv
+__pycache__/
+*.py[cod]
+
+# engagement data, not code
+users.txt
+admins.txt

