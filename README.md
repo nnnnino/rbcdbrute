@@ -9,45 +9,13 @@ It runs an S4U2Self + S4U2Proxy exchange per user, then tries to connect to the
 local administrators, so a successful tree connect is the answer. Everything is
 pure impacket — no `smbclient`, no external binary, no ticket written to disk.
 
-```
-[*] Authentication
-    account   ATTACKER$@RED.LOCAL
-    method    NT hash -> AS-REQ
-    KDC       10.10.100.10
-    TGT       OK
+## Why
 
-[*] Target
-    host      WK01.red.local (10.10.100.11:445)
-    SPN       cifs/WK01.red.local
-    check     S4U2Self + S4U2Proxy, then ADMIN$ tree connect
-    SPN check OK
-
-[*] Run
-    users     1007
-    threads   20
-    timeout   10s  (SMB)
-    output    stdout only (-o FILE to save)
-
-[+] ADMIN    Administrator
-[+] ADMIN    nnino
-
--------------------------- Summary --------------------------
-       2  admins    local administrators of the target
-      72  no ticket not delegatable, disabled, locked out or expired
-       3  unknown   no such principal in the realm
-       0  errors    unexpected failures
-    1007  checked   out of 1007 in 12.8s
-
-  no ticket breakdown:
-       40x  KDC_ERR_BADOPTION
-       32x  KDC_ERR_CLIENT_REVOKED
-
-  Local admins (-o FILE to save them)
-    + Administrator
-    + nnino
-```
-
-<!-- POC: screenshot / asciinema of a full run -->
+I used to do this with a `for` loop around NetExec, one impersonation per
+iteration. It worked, but on a thousand-user domain it was painfully slow because each
+call re-negotiated everything from scratch. `rbcdbrute` requests the TGT **once**
+and reuses it across a thread pool, so the same run drops from minutes to
+seconds (1007 users in ~13s while testing).
 
 ## Prerequisites
 
