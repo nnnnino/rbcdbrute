@@ -23,18 +23,32 @@ and the target (445/tcp).
 
 ## Install
 
+With [pipx](https://pipx.pypa.io) (recommended), which gives you a `rbcdbrute`
+command in its own isolated environment:
+
+```bash
+pipx install git+https://github.com/nnnnino/rbcdbrute.git
+```
+
+Upgrade later with `pipx upgrade rbcdbrute`.
+
+Or the old way, from a clone in a venv:
+
 ```bash
 git clone https://github.com/nnnnino/rbcdbrute.git
 cd rbcdbrute
 python3 -m venv venv && source venv/bin/activate
-pip install impacket tqdm
+pip install .        # or: pip install impacket tqdm, then python3 rbcdbrute.py
 ```
 
 ## Usage
 
 ```
-rbcdbrute.py [options] domain.local/username[:password]
+rbcdbrute [options] domain.local/username[:password]
 ```
+
+The examples below use `python3 rbcdbrute.py`; with a pipx install, just call
+`rbcdbrute` instead.
 
 The positional arg is **your** account (the one RBCD is delegated *from*).
 `-target` is the machine to enumerate, given as a **machine account name**

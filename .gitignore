@@ -2,6 +2,9 @@ venv
 .venv
 __pycache__/
 *.py[cod]
+build/
+dist/
+*.egg-info/
 
 # engagement data, not code
 users.txt
